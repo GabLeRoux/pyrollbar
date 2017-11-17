@@ -5,6 +5,7 @@ from __future__ import absolute_import
 from __future__ import unicode_literals
 
 import copy
+import functools
 import inspect
 import json
 import logging
@@ -23,10 +24,16 @@ import six
 
 from rollbar.lib import dict_merge, parse_qs, text, transport, urljoin, iteritems
 
-__version__ = '0.13.7'
+__version__ = '0.13.17'
 __log_name__ = 'rollbar'
 log = logging.getLogger(__log_name__)
 
+try:
+    # 2.x
+    import Queue as queue
+except ImportError:
+    # 3.x
+    import queue
 
 # import request objects from various frameworks, if available
 try:
@@ -236,8 +243,12 @@ SETTINGS = {
         'sizes': DEFAULT_LOCALS_SIZES,
         'whitelisted_types': []
     },
-    'verify_https': True
+    'verify_https': True,
+    'shortener_keys': [],
+    'suppress_reinit_warning': False,
 }
+
+_CURRENT_LAMBDA_CONTEXT = None
 
 # Set in init()
 _transforms = []
@@ -272,13 +283,14 @@ def init(access_token, environment='production', **kw):
                  'staging', 'yourname'
     **kw: provided keyword arguments will override keys in SETTINGS.
     """
-    global SETTINGS, agent_log, _initialized, _transforms, _serialize_transform
+    global SETTINGS, agent_log, _initialized, _transforms, _serialize_transform, _threads
 
     if _initialized:
         # NOTE: Temp solution to not being able to re-init.
         # New versions of pyrollbar will support re-initialization
         # via the (not-yet-implemented) configure() method.
-        log.warn('Rollbar already initialized. Ignoring re-init.')
+        if not SETTINGS.get('suppress_reinit_warning'):
+            log.warning('Rollbar already initialized. Ignoring re-init.')
         return
 
     SETTINGS['access_token'] = access_token
@@ -308,8 +320,12 @@ def init(access_token, environment='production', **kw):
         ScrubUrlTransform(suffixes=[(field,) for field in SETTINGS['url_fields']], params_to_scrub=SETTINGS['scrub_fields'])
     ]
 
-    # A list of key prefixes to apply our shortener transform to
+    # A list of key prefixes to apply our shortener transform to. The request
+    # being included in the body key is old behavior and is being retained for
+    # backwards compatibility.
     shortener_keys = [
+        ('request', 'POST'),
+        ('request', 'json'),
         ('body', 'request', 'POST'),
         ('body', 'request', 'json'),
     ]
@@ -320,12 +336,35 @@ def init(access_token, environment='production', **kw):
         shortener_keys.append(('body', 'trace', 'frames', '*', 'kwargs', '*'))
         shortener_keys.append(('body', 'trace', 'frames', '*', 'locals', '*'))
 
+    shortener_keys.extend(SETTINGS['shortener_keys'])
+
     shortener = ShortenerTransform(safe_repr=SETTINGS['locals']['safe_repr'],
                                    keys=shortener_keys,
                                    **SETTINGS['locals']['sizes'])
     _transforms.append(shortener)
 
+    _threads = queue.Queue()
+
     _initialized = True
+
+
+def lambda_function(f):
+    """
+    Decorator for making error handling on AWS Lambda easier
+    """
+    @functools.wraps(f)
+    def wrapper(event, context):
+        global _CURRENT_LAMBDA_CONTEXT
+        _CURRENT_LAMBDA_CONTEXT = context
+        try:
+            result = f(event, context)
+            return wait(lambda: result)
+        except:
+            cls, exc, trace = sys.exc_info()
+            report_exc_info((cls, exc, trace.tb_next))
+            wait()
+            raise
+    return wrapper
 
 
 def report_exc_info(exc_info=None, request=None, extra_data=None, payload_data=None, level=None, **kw):
@@ -408,6 +447,7 @@ def send_payload(payload, access_token):
     else:
         # default to 'thread'
         thread = threading.Thread(target=_send_payload, args=(payload, access_token))
+        _threads.put(thread)
         thread.start()
 
 
@@ -436,6 +476,12 @@ def search_items(title, return_fields=None, access_token=None, endpoint=None, **
                     access_token=access_token,
                     endpoint=endpoint,
                     **search_fields)
+
+
+def wait(f=None):
+    _threads.join()
+    if f is not None:
+        return f()
 
 
 class ApiException(Exception):
@@ -573,31 +619,35 @@ def _report_exc_info(exc_info, request, extra_data, payload_data, level=None):
     if level:
         data['level'] = level
 
-    # exception info
-    # most recent call last
-    raw_frames = traceback.extract_tb(trace)
-    frames = [{'filename': f[0], 'lineno': f[1], 'method': f[2], 'code': f[3]} for f in raw_frames]
+    # walk the trace chain to collect cause and context exceptions
+    trace_chain = _walk_trace_chain(cls, exc, trace)
 
-    data['body'] = {
-        'trace': {
-            'frames': frames,
-            'exception': {
-                'class': cls.__name__,
-                'message': text(exc),
-            }
+    extra_trace_data = None
+    if len(trace_chain) > 1:
+        data['body'] = {
+            'trace_chain': trace_chain
         }
-    }
+        if payload_data and ('body' in payload_data) and ('trace' in payload_data['body']):
+            extra_trace_data = payload_data['body']['trace']
+            del payload_data['body']['trace']
+    else:
+        data['body'] = {
+            'trace': trace_chain[0]
+        }
 
     if extra_data:
         extra_data = extra_data
-        if isinstance(extra_data, dict):
-            data['custom'] = extra_data
-        else:
-            data['custom'] = {'value': extra_data}
+        if not isinstance(extra_data, dict):
+            extra_data = {'value': extra_data}
+        if extra_trace_data:
+            extra_data = dict_merge(extra_data, extra_trace_data)
+        data['custom'] = extra_data
+    if extra_trace_data and not extra_data:
+        data['custom'] = extra_trace_data
 
-    _add_locals_data(data, exc_info)
     _add_request_data(data, request)
     _add_person_data(data, request)
+    _add_lambda_context_data(data)
     data['server'] = _build_server_data()
 
     if payload_data:
@@ -607,6 +657,37 @@ def _report_exc_info(exc_info, request, extra_data, payload_data, level=None):
     send_payload(payload, data.get('access_token'))
 
     return data['uuid']
+
+
+def _walk_trace_chain(cls, exc, trace):
+    trace_chain = [_trace_data(cls, exc, trace)]
+
+    while True:
+        exc = getattr(exc, '__cause__', None) or getattr(exc, '__context__', None)
+        if not exc:
+            break
+        trace_chain.append(_trace_data(type(exc), exc, getattr(exc, '__traceback__', None)))
+
+    return trace_chain
+
+
+def _trace_data(cls, exc, trace):
+    # exception info
+    # most recent call last
+    raw_frames = traceback.extract_tb(trace)
+    frames = [{'filename': f[0], 'lineno': f[1], 'method': f[2], 'code': f[3]} for f in raw_frames]
+
+    trace_data = {
+        'frames': frames,
+        'exception': {
+            'class': getattr(cls, '__name__', cls.__class__.__name__),
+            'message': text(exc),
+        }
+    }
+
+    _add_locals_data(trace_data, (cls, exc, trace))
+
+    return trace_data
 
 
 def _report_message(message, level, request, extra_data, payload_data):
@@ -631,6 +712,7 @@ def _report_message(message, level, request, extra_data, payload_data):
 
     _add_request_data(data, request)
     _add_person_data(data, request)
+    _add_lambda_context_data(data)
     data['server'] = _build_server_data()
 
     if payload_data:
@@ -646,6 +728,10 @@ def _check_config():
     if not SETTINGS.get('enabled'):
         log.info("pyrollbar: Not reporting because rollbar is disabled.")
         return False
+
+    # skip access token check for the agent handler
+    if SETTINGS.get('handler') == 'agent':
+        return True
 
     # make sure we have an access_token
     if not SETTINGS.get('access_token'):
@@ -762,11 +848,11 @@ def _flatten_nested_lists(l):
     return ret
 
 
-def _add_locals_data(data, exc_info):
+def _add_locals_data(trace_data, exc_info):
     if not SETTINGS['locals']['enabled']:
         return
 
-    frames = data['body']['trace']['frames']
+    frames = trace_data['frames']
 
     cur_tb = exc_info[2]
     frame_num = 0
@@ -845,6 +931,34 @@ def _serialize_frame_data(data):
     return data
 
 
+def _add_lambda_context_data(data):
+    """
+    Attempts to add information from the lambda context if it exists
+    """
+    global _CURRENT_LAMBDA_CONTEXT
+    context = _CURRENT_LAMBDA_CONTEXT
+    if context is None:
+        return
+    try:
+        lambda_data = {
+            'lambda': {
+                'remaining_time_in_millis': context.get_remaining_time_in_millis(),
+                'function_name': context.function_name,
+                'function_version': context.function_version,
+                'arn': context.invoked_function_arn,
+                'request_id': context.aws_request_id,
+            }
+        }
+        if 'custom' in data:
+            data['custom'] = dict_merge(data['custom'], lambda_data)
+        else:
+            data['custom'] = lambda_data
+    except Exception as e:
+        log.exception("Exception while adding lambda context data: %r", e)
+    finally:
+        _CURRENT_LAMBDA_CONTEXT = None
+
+
 def _add_request_data(data, request):
     """
     Attempts to build request data; if successful, sets the 'request' key on `data`.
@@ -918,6 +1032,7 @@ def _build_webob_request_data(request):
         'GET': dict(request.GET),
         'user_ip': _extract_user_ip(request),
         'headers': dict(request.headers),
+        'method': request.method,
     }
 
     try:
@@ -957,11 +1072,6 @@ def _build_django_request_data(request):
         'POST': dict(request.POST),
         'user_ip': _wsgi_extract_user_ip(request.environ),
     }
-
-    try:
-        request_data['body'] = request.body
-    except:
-        pass
 
     request_data['headers'] = _extract_wsgi_headers(request.environ.items())
 
@@ -1056,9 +1166,13 @@ def _build_server_data():
     # server environment
     server_data = {
         'host': socket.gethostname(),
-        'argv': sys.argv,
         'pid': os.getpid()
     }
+
+    # argv does not always exist in embedded python environments
+    argv = getattr(sys, 'argv', None)
+    if argv:
+         server_data['argv'] = argv
 
     for key in ['branch', 'root']:
         if SETTINGS.get(key):
@@ -1095,6 +1209,11 @@ def _send_payload(payload, access_token):
         _post_api('item/', payload, access_token=access_token)
     except Exception as e:
         log.exception('Exception while posting item %r', e)
+    try:
+        _threads.get_nowait()
+        _threads.task_done()
+    except queue.Empty:
+        pass
 
 
 def _send_payload_appengine(payload, access_token):
